@@ -1,8 +1,10 @@
 import Layer from '../../Layer'
 import Tensor from '../../Tensor'
-import { webgl2 } from '../../WebGL2'
 import ops from 'ndarray-ops'
-import programSource from './BatchNormalization.glsl'
+import unpack from 'ndarray-unpack'
+import flattenDeep from 'lodash/flattenDeep'
+import checkPipelineSupport from '../../utils/checkPipelineSupport'
+import WebGLBatchNorm from '../../ext/normalization/WebGLBatchNorm'
 
 /**
  * BatchNormalization layer class
@@ -10,8 +12,6 @@ import programSource from './BatchNormalization.glsl'
 export default class BatchNormalization extends Layer {
   /**
    * Creates an BatchNormalization layer
-   *
-   * @param {Object} [attrs] - layer config attributes
    */
   constructor(attrs = {}) {
     super(attrs)
@@ -39,33 +39,67 @@ export default class BatchNormalization extends Layer {
     }
     this.params = this.params.concat(['moving_mean', 'moving_variance'])
 
-    // GPU setup
-    if (this.gpu) {
-      this.program = webgl2.compileProgram(programSource)
+    // Enable layer gpu +/- pipeline mode if supported
+    if (this.gpu && weblas) {
+      this._useWeblas = true
+      if (this.pipeline) {
+        const isPipelineModeSupported = checkPipelineSupport(this.layerClass, attrs)
+        if (isPipelineModeSupported) {
+          this._pipelineEnabled = true
+          this.webglBatchNorm = new WebGLBatchNorm()
+        } else {
+          this._pipelineEnabled = false
+        }
+      }
     }
   }
 
   /**
-   * Layer computational logic
-   *
-   * @param {Tensor} x
-   * @returns {Tensor}
+   * Method for setting layer weights. Extends `super` method.
+   * @param {Tensor[]} weightsArr - array of weights which are instances of Tensor
    */
-  call(x) {
-    if (this.gpu) {
-      this._callGPU(x)
-    } else {
-      this._callCPU(x)
+  setWeights(weightsArr) {
+    super.setWeights(weightsArr)
+
+    if (this._useWeblas) {
+      this.params.forEach(param => {
+        this.weights[param].createWeblasTensor()
+      })
     }
-    return this.output
   }
 
   /**
-   * CPU call
-   *
+   * Runs layer computational logic in pipeline mode
+   * Only works with a previous convolutional layer with its output containing
+   * a weblas pipeline tensor which is a 2-D tiled representation (tile data, channels).
+   * The output after normalization is still a 2-D tiled representation (typically as input
+   * to convolution or merge layers running in pipeline mode).
    * @param {Tensor} x
+   * @returns {Tensor} x
    */
-  _callCPU(x) {
+  _callPipelineMode(x) {
+    if (!x._fromPipeline) {
+      return this._callRegularMode(x)
+    }
+
+    x.weblasTensor = this.webglBatchNorm.call(
+      x.weblasTensor,
+      this.epsilon,
+      this.weights.gamma.weblasTensor,
+      this.weights.beta.weblasTensor,
+      this.weights.moving_mean.weblasTensor,
+      this.weights.moving_variance.weblasTensor
+    )
+
+    return x
+  }
+
+  /**
+   * Runs layer computational logic in regular mode
+   * @param {Tensor} x
+   * @returns {Tensor} x
+   */
+  _callRegularMode(x) {
     if (!this.axisNormalized) {
       this.axis = this.axis < 0 ? x.tensor.shape.length + this.axis : this.axis - 1
       this.axisNormalized = true
@@ -83,10 +117,10 @@ export default class BatchNormalization extends Layer {
     for (let i = 0; i < x.tensor.shape[this.axis]; i++) {
       broadcast[this.axis] = i
       if (this.scale) {
-        ops.assigns(_gamma.tensor.pick(...broadcast), this.weights['gamma'].tensor.get(i))
+        ops.assigns(_gamma.tensor.pick(...broadcast), this.weights.gamma.tensor.get(i))
       }
       if (this.center) {
-        ops.assigns(_beta.tensor.pick(...broadcast), this.weights['beta'].tensor.get(i))
+        ops.assigns(_beta.tensor.pick(...broadcast), this.weights.beta.tensor.get(i))
       }
     }
 
@@ -96,130 +130,33 @@ export default class BatchNormalization extends Layer {
     // feature-wise normalization
     for (let i = 0; i < x.tensor.shape[this.axis]; i++) {
       broadcast[this.axis] = i
-      ops.assigns(_mean.tensor.pick(...broadcast), this.weights['moving_mean'].tensor.get(i))
-      ops.assigns(_std.tensor.pick(...broadcast), this.weights['moving_variance'].tensor.get(i) + this.epsilon)
+      ops.assigns(_mean.tensor.pick(...broadcast), this.weights.moving_mean.tensor.get(i))
+      ops.assigns(_std.tensor.pick(...broadcast), this.weights.moving_variance.tensor.get(i) + this.epsilon)
     }
     ops.sqrteq(_std.tensor)
 
-    this.output = new Tensor(x.tensor.data, x.tensor.shape)
-
-    ops.subeq(this.output.tensor, _mean.tensor)
-    ops.diveq(this.output.tensor, _std.tensor)
+    ops.subeq(x.tensor, _mean.tensor)
+    ops.diveq(x.tensor, _std.tensor)
     if (this.scale) {
-      ops.muleq(this.output.tensor, _gamma.tensor)
+      ops.muleq(x.tensor, _gamma.tensor)
     }
     if (this.center) {
-      ops.addeq(this.output.tensor, _beta.tensor)
+      ops.addeq(x.tensor, _beta.tensor)
     }
+
+    return x
   }
 
   /**
-   * Pre-compute index maps for GPU batchnorm function
-   *
-   * @param {number[]} glTextureShape
-   * @param {Object} indicesForReshaped
-   */
-  _createIndexMap(glTextureShape, indicesForReshaped) {
-    if (this.normAxisIndexMap) {
-      return
-    }
-
-    const _normAxisIndexMap = new Tensor([], this.inputShape, { type: Int32Array })
-    this.normAxisIndexMap = new Tensor([], glTextureShape, { type: Int32Array })
-
-    const slice = Array(this.inputShape.length).fill(null)
-    for (let i = 0; i < this.inputShape[this.axis]; i++) {
-      slice[this.axis] = i
-      ops.assigns(_normAxisIndexMap.tensor.pick(...slice), i)
-    }
-
-    if (indicesForReshaped) {
-      for (let i = 0; i < indicesForReshaped.data.length; i++) {
-        this.normAxisIndexMap.tensor.data[indicesForReshaped.data[i]] = _normAxisIndexMap.tensor.data[i]
-      }
-    } else {
-      this.normAxisIndexMap = _normAxisIndexMap
-    }
-
-    this.normAxisIndexMap.createGLTexture({ type: '2d', format: 'int', supportsTextureFragments: true })
-  }
-
-  /**
-   * GPU call
-   * (will only work on the 2D-reshaped representation for post-convolutional BN)
-   *
+   * Method for layer computational logic
    * @param {Tensor} x
+   * @returns {Tensor} x
    */
-  _callGPU(x) {
-    if (!this.axisNormalized) {
-      if (x.is2DReshaped || x.is2DSquareReshaped) {
-        this.inputShape = x.originalShape
-      } else {
-        this.inputShape = x.tensor.shape
-      }
-      this.axis = this.axis < 0 ? this.inputShape.length + this.axis : this.axis - 1
-      this.axisNormalized = true
-    }
-
-    if (!x.glTexture && !x.glTextureFragments) {
-      if (x.tensor.shape.length <= 2) {
-        x.createGLTexture({ type: '2d', format: 'float', supportsTextureFragments: true })
-      } else if (x.tensor.shape.length > 2 && !x.is2DReshaped) {
-        // defaults to square reshaped
-        x.reshapeTo2DSquare()
-        x.createGLTexture({ type: '2d', format: 'float', supportsTextureFragments: true })
-      }
-    }
-
-    this._createIndexMap(x.glTextureShape, x.indicesForReshaped)
-
-    // create output textures if doesn't already exist
-    if (!this.output) {
-      this.output = new Tensor([], x.glTextureShape)
-      this.output.createGLTexture({ type: '2d', format: 'float', supportsTextureFragments: true })
-      if (x.is1D) {
-        this.output.is1D = x.is1D
-      } else if (x.is2DReshaped || x.is2DSquareReshaped) {
-        if (x.is2DReshaped) {
-          this.output.is2DReshaped = x.is2DReshaped
-        } else if (x.is2DSquareReshaped) {
-          this.output.is2DSquareReshaped = x.is2DSquareReshaped
-        }
-        this.output.originalShape = x.originalShape
-        this.output.indicesForReshaped = x.indicesForReshaped
-      }
-    }
-
-    const programInputs = [{ input: x, name: 'X' }, { input: this.normAxisIndexMap, name: 'normAxisIndexMap' }]
-    if (this.scale) {
-      programInputs.push({ input: this.weights['gamma'], name: 'gamma' })
-    }
-    if (this.center) {
-      programInputs.push({ input: this.weights['beta'], name: 'beta' })
-    }
-    programInputs.push({ input: this.weights['moving_mean'], name: 'mean' })
-    programInputs.push({ input: this.weights['moving_variance'], name: 'std' })
-    const programUniforms = [
-      { value: this.epsilon, type: 'float', name: 'epsilon' },
-      { value: +this.scale, type: 'bool', name: 'scale' },
-      { value: +this.center, type: 'bool', name: 'center' }
-    ]
-    webgl2.runProgram({
-      program: this.program,
-      output: this.output,
-      inputs: programInputs,
-      uniforms: programUniforms,
-      supportsTextureFragments: true
-    })
-
-    // GPU -> CPU data transfer
-    if (this.outbound.length === 0) {
-      this.output.transferFromGLTexture()
-      if (this.output.is2DReshaped) {
-        this.output.reshapeFrom2D()
-      } else if (this.output.is2DSquareReshaped) {
-        this.output.reshapeFrom2DSquare()
-      }
+  call(x) {
+    if (this._pipelineEnabled) {
+      return this._callPipelineMode(x)
+    } else {
+      return this._callRegularMode(x)
     }
   }
 }

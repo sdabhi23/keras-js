@@ -1,11 +1,8 @@
-import Layer from '../../Layer'
-import Tensor from '../../Tensor'
 import * as activations from '../../activations'
-import { webgl2 } from '../../WebGL2'
+import Tensor from '../../Tensor'
+import Layer from '../../Layer'
 import { gemv } from 'ndarray-blas-level2'
 import ops from 'ndarray-ops'
-import matMulProgramSource from '../../webgl/matMul.glsl'
-import * as activationProgramSources from '../../activations/programSources'
 
 /**
  * Dense layer class
@@ -13,9 +10,8 @@ import * as activationProgramSources from '../../activations/programSources'
 export default class Dense extends Layer {
   /**
    * Creates a Dense layer
-   *
-   * @param {Object} [attrs] - layer config attributes
-   * @param {number} [attrs.units] - output dimension size
+   * @param {number} attrs.units - output dimension size
+   * @param {Object} [attrs] - layer attributes
    */
   constructor(attrs = {}) {
     super(attrs)
@@ -23,102 +19,83 @@ export default class Dense extends Layer {
 
     const { units = 1, activation = 'linear', input_dim = null, use_bias = true } = attrs
 
-    this.description = `${activation} activation, output dimensions: ${units}`
-
     this.activation = activation
-    this.activationFunc = activations[this.activation]
+    this.activationFunc = activations[activation]
     this.units = units
-    this.input_dim = input_dim
+    this.inputDim = input_dim
     this.use_bias = use_bias
 
     // Layer weights specification
     this.params = this.use_bias ? ['kernel', 'bias'] : ['kernel']
 
     // Input shape specification
-    if (this.input_dim) {
-      this.inputShape = [this.input_dim]
+    if (this.inputDim) {
+      this.inputShape = [this.inputDim]
     }
 
-    // GPU setup
-    if (this.gpu) {
-      this.matMulProgram = webgl2.compileProgram(matMulProgramSource)
-      this.activationProgram = webgl2.compileProgram(activationProgramSources[this.activation])
+    // Enable layer gpu +/- pipeline mode if supported
+    if (this.gpu && weblas) {
+      this._useWeblas = true
+      this._pipelineEnabled = false
     }
   }
 
   /**
-   * Layer computational logic
+   * Method for setting layer weights. Extends `super` method.
+   * @param {Tensor[]} weightsArr - array of weights which are instances of Tensor
+   */
+  setWeights(weightsArr) {
+    super.setWeights(weightsArr)
+
+    if (this._useWeblas) {
+      this.weights['kernel'].createWeblasTensor()
+      if (!this.weights['kernel']._gpuMaxSizeExceeded) {
+        this.weights['kernel'].weblasTensor = this.weights['kernel'].weblasTensor.transpose()
+      }
+      if (this.use_bias) {
+        this.weights['bias'].createWeblasTensor()
+      } else {
+        this._zerosVec = new Tensor([], [this.weights['kernel'].tensor.shape[1]])
+        this._zerosVec.createWeblasTensor()
+      }
+    }
+  }
+
+  /**
+   * Method for layer computational logic
+   *
+   * x = W^T * x + b
+   *
+   * weblas notes:
+   * sgemm(M, N, K, alpha, A, B, beta, C), where A, B, C are Float32Array
+   * - alpha * A * B + beta * C
+   * - A has shape M x N
+   * - B has shape N x K
+   * - C has shape M x K
    *
    * @param {Tensor} x
-   * @returns {Tensor}
+   * @returns {Tensor} x
    */
   call(x) {
-    if (this.gpu) {
-      this._callGPU(x)
+    let y = new Tensor([], [this.units])
+
+    if (this._useWeblas) {
+      x.createWeblasTensor()
+    }
+
+    if (this._useWeblas && !(x._gpuMaxSizeExceeded || this.weights['kernel']._gpuMaxSizeExceeded)) {
+      const bias = this.use_bias ? this.weights['bias'].weblasTensor : this._zerosVec.weblasTensor
+      y.tensor.data = weblas.pipeline.sgemm(1, x.weblasTensor, this.weights['kernel'].weblasTensor, 1, bias).transfer()
     } else {
-      this._callCPU(x)
+      if (this.use_bias) {
+        ops.assign(y.tensor, this.weights['bias'].tensor)
+      }
+      gemv(1, this.weights['kernel'].tensor.transpose(1, 0), x.tensor, 1, y.tensor)
     }
-    return this.output
-  }
+    x.tensor = y.tensor
 
-  /**
-   * CPU call
-   *
-   * @param {Tensor} x
-   */
-  _callCPU(x) {
-    this.output = new Tensor([], [this.units])
-    if (this.use_bias) {
-      ops.assign(this.output.tensor, this.weights['bias'].tensor)
-    }
-    gemv(1, this.weights['kernel'].tensor.transpose(1, 0), x.tensor, 1, this.output.tensor)
-    this.activationFunc(this.output)
-  }
+    this.activationFunc(x)
 
-  /**
-   * GPU call
-   *
-   * @param {Tensor} x
-   */
-  _callGPU(x) {
-    if (!x.glTexture) {
-      x.createGLTexture({ type: '2d', format: 'float' })
-    }
-
-    // create output textures if doesn't already exist
-    if (this.activation !== 'linear' && !this.outputPreactiv) {
-      this.outputPreactiv = new Tensor([], [this.units])
-      this.outputPreactiv.createGLTexture({ type: '2d', format: 'float' })
-    }
-    if (!this.output) {
-      this.output = new Tensor([], [this.units])
-      this.output.createGLTexture({ type: '2d', format: 'float' })
-    }
-
-    // Matrix Multiply
-    const matMulInputs = [{ input: x, name: 'A' }, { input: this.weights['kernel'], name: 'B' }]
-    if (this.use_bias) {
-      matMulInputs.push({ input: this.weights['bias'], name: 'C' })
-    }
-    webgl2.runProgram({
-      program: this.matMulProgram,
-      output: this.activation === 'linear' ? this.output : this.outputPreactiv,
-      inputs: matMulInputs,
-      uniforms: [{ value: this.use_bias ? 1 : 0, type: 'bool', name: 'addC' }]
-    })
-
-    // Activation
-    if (this.activation !== 'linear') {
-      webgl2.runProgram({
-        program: this.activationProgram,
-        output: this.output,
-        inputs: [{ input: this.outputPreactiv, name: 'x' }]
-      })
-    }
-
-    // GPU -> CPU data transfer
-    if (this.outbound.length === 0) {
-      this.output.transferFromGLTexture()
-    }
+    return x
   }
 }

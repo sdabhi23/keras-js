@@ -15,8 +15,9 @@
 <br/>
 
 ---
-
-**Updated the module to resolve [#109 (babel polyfill issue)](https://github.com/transcranial/keras-js/issues/109)**
+**CHANGELOG:**
+- Switch to v0.3.0 of the original library
+- Updated the module to resolve [#109 (babel polyfill issue)](https://github.com/transcranial/keras-js/issues/109)
 
 Run [Keras](https://github.com/keras-team/keras) models in the browser, with GPU support provided by WebGL 2. Models can be run in Node.js as well, but only in CPU mode. Because Keras abstracts away a number of frameworks as backends, the models can be trained in any backend, including TensorFlow, CNTK, etc.
 

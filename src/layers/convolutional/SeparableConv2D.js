@@ -1,37 +1,22 @@
-import Layer from '../../Layer'
-import Tensor from '../../Tensor'
 import * as activations from '../../activations'
-import { webgl2 } from '../../WebGL2'
-import * as tensorUtils from '../../utils/tensorUtils'
+import Tensor from '../../Tensor'
+import Layer from '../../Layer'
+import Conv2D from './Conv2D'
 import ops from 'ndarray-ops'
 import gemm from 'ndarray-gemm'
-import Conv2D from './Conv2D'
-import * as activationProgramSources from '../../activations/programSources'
 
 /**
  * _DepthwiseConv2D layer class
  */
 class _DepthwiseConv2D extends Conv2D {
-  /**
-   * @param {Object} [attrs]
-   */
   constructor(attrs = {}) {
     super(attrs)
   }
 
   /**
-   * @param {number[]} inputShape
-   */
-  _calcOutputShape(inputShape) {
-    super._calcOutputShape(inputShape)
-    const nbFilter = this.kernelShape[0]
-    const inputChannels = inputShape[2]
-    this.outputShape[2] = nbFilter * inputChannels
-  }
-
-  /**
+   * Convert input image to column matrix
    * @param {Tensor} x
-   * @returns {Tensor}
+   * @returns {Tensor} x
    */
   _im2col(x) {
     const [inputRows, inputCols, inputChannels] = x.tensor.shape
@@ -42,8 +27,8 @@ class _DepthwiseConv2D extends Conv2D {
     const nbPatches = outputRows * outputCols
     const patchLen = nbRow * nbCol
 
-    if (!this.imColsMat) {
-      this.imColsMat = new Tensor([], [nbPatches * inputChannels, patchLen])
+    if (!this._imColsMat) {
+      this._imColsMat = new Tensor([], [nbPatches * inputChannels, patchLen])
     }
 
     let patch = new Tensor([], [nbRow, nbCol, 1])
@@ -52,24 +37,28 @@ class _DepthwiseConv2D extends Conv2D {
       for (let i = 0, limit = inputRows - nbRow; i <= limit; i += this.strides[0]) {
         for (let j = 0, limit = inputCols - nbCol; j <= limit; j += this.strides[1]) {
           ops.assign(patch.tensor, x.tensor.hi(i + nbRow, j + nbCol, c + 1).lo(i, j, c))
-          this.imColsMat.tensor.data.set(patch.tensor.data, offset)
+          this._imColsMat.tensor.data.set(patch.tensor.data, offset)
           offset += patchLen
         }
       }
     }
 
-    return this.imColsMat
+    if (this._useWeblas) {
+      this._imColsMat.createWeblasTensor()
+    }
+    return this._imColsMat
   }
 
   /**
-   * @returns {Tensor}
+   * Convert filter weights to row matrix
+   * @returns {Tensor|weblas.pipeline.Tensor} wRowsMat
    */
   _w2row() {
     const inputChannels = this.weights['kernel'].tensor.shape[2]
     const [nbFilter, nbRow, nbCol] = this.kernelShape
     const patchLen = nbRow * nbCol
 
-    this.wRowsMat = new Tensor([], [patchLen, nbFilter * inputChannels])
+    this._wRowsMat = new Tensor([], [patchLen, nbFilter * inputChannels])
 
     let patch = new Tensor([], [nbRow, nbCol])
     let patchRaveled = new Tensor([], [patchLen])
@@ -78,144 +67,60 @@ class _DepthwiseConv2D extends Conv2D {
       for (let n = 0; n < nbFilter; n++) {
         ops.assign(patch.tensor, this.weights['kernel'].tensor.pick(null, null, c, n))
         patchRaveled.replaceTensorData(patch.tensor.data)
-        ops.assign(this.wRowsMat.tensor.pick(null, p), patchRaveled.tensor)
+        ops.assign(this._wRowsMat.tensor.pick(null, p), patchRaveled.tensor)
         p += 1
       }
     }
 
-    return this.wRowsMat
+    return this._wRowsMat
   }
 
   /**
+   * Method for layer computational logic
    * @param {Tensor} x
+   * @returns {Tensor} x
    */
-  _callCPU(x) {
-    this.inputShape = x.tensor.shape
-    this._calcOutputShape(this.inputShape)
-    x = this._padInput(x)
+  call(x) {
+    this._calcOutputShape(x.tensor.shape)
+    this._padInput(x)
+
     this._im2col(x)
 
     const nbFilter = this.kernelShape[0]
     const outputRows = this.outputShape[0]
     const outputCols = this.outputShape[1]
     const nbPatches = outputRows * outputCols
-    const inputChannels = this.inputShape[2]
-    const matMul = new Tensor([], [nbPatches * inputChannels, nbFilter * inputChannels])
+    const matMul = new Tensor([], [nbPatches * x.tensor.shape[2], nbFilter * x.tensor.shape[2]])
 
-    gemm(matMul.tensor, this.imColsMat.tensor, this.wRowsMat.tensor, 1, 1)
+    if (this._useWeblas && !(this._imColsMat._gpuMaxSizeExceeded || this._wRowsMat._gpuMaxSizeExceeded)) {
+      // GPU
+      matMul.tensor.data = weblas.pipeline
+        .sgemm(1, this._imColsMat.weblasTensor, this._wRowsMat.weblasTensor, 1, this._zerosVec.weblasTensor)
+        .transfer()
+    } else {
+      // CPU
+      gemm(matMul.tensor, this._imColsMat.tensor, this._wRowsMat.tensor, 1, 1)
+    }
 
-    this.output = new Tensor([], this.outputShape)
-
-    const outputDataLength = outputRows * outputCols * nbFilter * inputChannels
+    let output = new Tensor([], [outputRows, outputCols, x.tensor.shape[2] * nbFilter])
+    const outputDataLength = outputRows * outputCols * x.tensor.shape[2] * nbFilter
     let dataFiltered = new Float32Array(outputDataLength)
-    for (let c = 0; c < inputChannels; c++) {
-      for (let n = c * outputDataLength + c * nbFilter; n < (c + 1) * outputDataLength; n += nbFilter * inputChannels) {
+    for (let c = 0; c < x.tensor.shape[2]; c++) {
+      for (
+        let i = 0, n = c * outputDataLength + c * nbFilter, len = (c + 1) * outputDataLength;
+        n < len;
+        i++, (n += nbFilter * x.tensor.shape[2])
+      ) {
         for (let m = 0; m < nbFilter; m++) {
           dataFiltered[n + m - c * outputDataLength] = matMul.tensor.data[n + m]
         }
       }
     }
-    this.output.replaceTensorData(dataFiltered)
-  }
+    output.replaceTensorData(dataFiltered)
 
-  /**
-   * @param {Object} indicesForReshaped
-   */
-  _createIndexMap(indicesForReshaped) {
-    if (this.indexMap) {
-      return
-    }
+    x.tensor = output.tensor
 
-    let [inputRows, inputCols, inputChannels] = this.inputShape
-
-    let indices = new Tensor(indicesForReshaped.data, indicesForReshaped.shape, { type: Int32Array })
-
-    // padding for border mode 'same'
-    if (this.padding === 'same') {
-      const [paddingRowBefore, paddingRowAfter, paddingColBefore, paddingColAfter] = this.inputPadding
-      inputRows = inputRows + paddingRowBefore + paddingRowAfter
-      inputCols = inputCols + paddingColBefore + paddingColAfter
-      const padValue = -1
-      indices = this._padInput(indices, padValue)
-    }
-
-    const nbRow = this.kernelShape[1]
-    const nbCol = this.kernelShape[2]
-    const outputRows = this.outputShape[0]
-    const outputCols = this.outputShape[1]
-    const nbPatches = outputRows * outputCols
-    const patchLen = nbRow * nbCol
-
-    this.indexMap = new Tensor([], [nbPatches * inputChannels, patchLen], { type: Int32Array })
-
-    const indicesPatch = new Tensor([], [nbRow, nbCol, 1])
-    let offset = 0
-    for (let c = 0; c < inputChannels; c++) {
-      for (let i = 0, limit = inputRows - nbRow; i <= limit; i += this.strides[0]) {
-        for (let j = 0, limit = inputCols - nbCol; j <= limit; j += this.strides[1]) {
-          ops.assign(indicesPatch.tensor, indices.tensor.hi(i + nbRow, j + nbCol, c + 1).lo(i, j, c))
-          this.indexMap.tensor.data.set(indicesPatch.tensor.data, offset)
-          offset += patchLen
-        }
-      }
-    }
-
-    this.indexMap.createGLTexture({ type: '2d', format: 'int', supportsTextureFragments: true })
-  }
-
-  _createOutputReshapeIndexMap() {
-    if (this.reshapeIndexMap) {
-      return
-    }
-
-    const nbFilter = this.kernelShape[0]
-    const reshape = [this.outputShape[0] * this.outputShape[1], this.outputShape[2]]
-    const reshapeRowIndices = new Tensor([], reshape, { type: Int32Array })
-    const reshapeColIndices = new Tensor([], reshape, { type: Int32Array })
-    this.reshapeIndexMap = new Tensor([], reshape, { type: Int32Array })
-    for (let j = 0; j < reshape[1]; j++) {
-      for (let i = 0; i < reshape[0]; i++) {
-        ops.assigns(reshapeRowIndices.tensor.pick(i, j), i + Math.floor(j / nbFilter) * reshape[0])
-      }
-    }
-    for (let j = 0; j < reshape[1]; j++) {
-      ops.assigns(reshapeColIndices.tensor.pick(null, j), j)
-    }
-    // i * cols + j
-    ops.muls(this.reshapeIndexMap.tensor, reshapeRowIndices.tensor, reshape[1])
-    ops.addeq(this.reshapeIndexMap.tensor, reshapeColIndices.tensor)
-
-    this.reshapeIndexMap.createGLTexture({ type: '2d', format: 'int', supportsTextureFragments: true })
-  }
-
-  /**
-   * @param {Tensor} x
-   */
-  _callGPU(x) {
-    super._callGPU(x)
-
-    this._createOutputReshapeIndexMap()
-    if (!this.outputReshaped) {
-      const reshape = [this.outputShape[0] * this.outputShape[1], this.outputShape[2]]
-      this.outputReshaped = new Tensor([], reshape)
-      this.outputReshaped.createGLTexture({ type: '2d', format: 'float', supportsTextureFragments: true })
-      this.outputReshaped.is2DReshaped = true
-      this.outputReshaped.originalShape = this.outputShape
-      this.outputReshaped.indicesForReshaped = tensorUtils.createIndicesFor2DReshaped(this.outputShape, false, -1)
-    }
-    if (this.output.glTextureFragments) {
-      this.output.convert2DRowFragmentedGLTextureToColStack()
-    }
-    webgl2.runProgram({
-      program: this.output.glTextureFragments ? this.mapInputFragmentsProgram : this.mapInputProgram,
-      output: this.outputReshaped,
-      inputs: [{ input: this.output, name: 'x' }, { input: this.reshapeIndexMap, name: 'indexMap' }],
-      uniforms: [{ value: this.output.glTextureShape[1], type: 'int', name: 'inputCols' }],
-      supportsTextureFragments: true
-    })
-    if (this.output.glTextureFragments) {
-      this.output.removeGLTextureFragmentsAsColStack()
-    }
+    return x
   }
 }
 
@@ -225,10 +130,9 @@ class _DepthwiseConv2D extends Conv2D {
 export default class SeparableConv2D extends Layer {
   /**
    * Creates a SeparableConv2D layer
-   *
-   * @param {Object} [attrs] - layer config attributes
-   * @param {number} [attrs.filters] - Number of convolution filters to use
-   * @param {number|number[]} [attrs.kernel_size] - Size of the convolution kernel
+   * @param {Number} attrs.filters - Number of convolution filters to use.
+   * @param {Array<Number>|Number} attrs.kernel_size - Size of the convolution kernel.
+   * @param {Object} [attrs] - layer attributes
    */
   constructor(attrs = {}) {
     super(attrs)
@@ -260,13 +164,13 @@ export default class SeparableConv2D extends Layer {
     if (padding === 'valid' || padding === 'same') {
       this.padding = padding
     } else {
-      this.throwError('Invalid padding.')
+      throw new Error(`${this.name} [Conv2D layer] Invalid padding.`)
     }
 
     if (data_format === 'channels_last' || data_format === 'channels_first') {
       this.dataFormat = data_format
     } else {
-      this.throwError('Only channels_last and channels_first data formats are allowed.')
+      throw new Error(`${this.name} [Conv2D layer] Only channels_last and channels_first data formats are allowed.`)
     }
 
     this.activation = activation
@@ -275,13 +179,13 @@ export default class SeparableConv2D extends Layer {
     if (padding === 'valid' || padding === 'same') {
       this.padding = padding
     } else {
-      this.throwError('Invalid padding.')
+      throw new Error(`${this.name} [SeparableConv2D layer] Invalid padding.`)
     }
 
-    this.useBias = use_bias
+    this.use_bias = use_bias
 
     // Layer weights specification
-    this.params = this.useBias
+    this.params = this.use_bias
       ? ['depthwise_kernel', 'pointwise_kernel', 'bias']
       : ['depthwise_kernel', 'pointwise_kernel']
 
@@ -308,22 +212,11 @@ export default class SeparableConv2D extends Layer {
       use_bias,
       gpu: attrs.gpu
     }
-
-    this.description = `${this.kernelShape[0]} ${this.kernelShape.slice(1).join('x')} filters`
-    this.description += this.strides.some(s => s > 1) ? `, ${this.strides.join('x')} striding` : ''
-    this.description += this.padding === 'valid' ? `, no border padding` : ', pad to same borders'
-    this.description += depth_multiplier > 1 ? `, depth multiplier: ${depth_multiplier}` : ''
-    this.description += this.activation !== 'linear' ? `, ${this.activation} activation` : ''
-
-    // GPU setup
-    if (this.gpu) {
-      this.activationProgram = webgl2.compileProgram(activationProgramSources[this.activation])
-    }
   }
 
   /**
-   * Method for setting layer weights. Override `super` method since weights must be set in component Conv2D layers.
-   *
+   * Method for setting layer weights
+   * Override `super` method since weights must be set in component Conv2D layers
    * @param {Tensor[]} weightsArr - array of weights which are instances of Tensor
    */
   setWeights(weightsArr) {
@@ -335,77 +228,21 @@ export default class SeparableConv2D extends Layer {
 
   /**
    * Method for layer computational logic
-   *
    * @param {Tensor} x
-   * @returns {Tensor}
+   * @returns {Tensor} x
    */
   call(x) {
-    if (this.gpu) {
-      this._callGPU(x)
-    } else {
-      this._callCPU(x)
-    }
-    return this.output
-  }
+    // Perform depthwise ops
+    const depthwiseOutput = this._depthwiseConv.call(x)
 
-  /**
-   * CPU call
-   *
-   * @param {Tensor} x
-   */
-  _callCPU(x) {
-    this._depthwiseConv._callCPU(x)
-    this._pointwiseConv._callCPU(this._depthwiseConv.output)
-    this.output = this._pointwiseConv.output
-    this.activationFunc(this.output)
-  }
+    // Perform depthwise ops
+    const pointwiseOutput = this._pointwiseConv.call(depthwiseOutput)
 
-  /**
-   * GPU call
-   *
-   * @param {Tensor} x
-   */
-  _callGPU(x) {
-    // prevent GPU -> CPU data transfer by specifying non-empty outbound nodes array on these internal Conv2D layers
-    this._depthwiseConv.outbound = [null]
-    this._pointwiseConv.outbound = [null]
+    x.tensor = pointwiseOutput.tensor
 
-    this._depthwiseConv._callGPU(x)
-    this._pointwiseConv._callGPU(this._depthwiseConv.outputReshaped)
+    // activation
+    this.activationFunc(x)
 
-    // Activation
-    if (this.activation === 'linear') {
-      this.output = this._pointwiseConv.output
-    } else {
-      if (!this.output) {
-        this.output = new Tensor([], this._pointwiseConv.output.glTextureShape)
-        this.output.createGLTexture({ type: '2d', format: 'float', supportsTextureFragments: true })
-        this.output.is2DReshaped = true
-        this.output.originalShape = this._pointwiseConv.output.originalShape
-        this.output.indicesForReshaped = tensorUtils.createIndicesFor2DReshaped(
-          this._pointwiseConv.output.originalShape,
-          false,
-          -1
-        )
-      }
-      this.outputPreactiv = this._pointwiseConv.output
-      webgl2.runProgram({
-        program: this.activationProgram,
-        output: this.output,
-        inputs: [{ input: this.outputPreactiv, name: 'x' }],
-        supportsTextureFragments: true
-      })
-    }
-
-    // GPU -> CPU data transfer
-    if (this.outbound.length === 0) {
-      this.output.transferFromGLTexture()
-      this.output.reshapeFrom2D()
-
-      // convert back to channels_first ordering if necessary
-      if (this.dataFormat === 'channels_first') {
-        this.output.tensor = this.output.tensor.transpose(2, 0, 1)
-      }
-    }
+    return x
   }
 }

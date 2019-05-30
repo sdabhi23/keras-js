@@ -1,13 +1,15 @@
 import Promise from 'bluebird'
 import axios from 'axios'
-import _ from 'lodash'
-import now from 'performance-now'
-import { EventEmitter } from 'eventemitter3'
+import toPairs from 'lodash/toPairs'
+import mapKeys from 'lodash/mapKeys'
+import find from 'lodash/find'
+import keys from 'lodash/keys'
+import values from 'lodash/values'
+import sum from 'lodash/sum'
+import isEqual from 'lodash/isEqual'
+import every from 'lodash/every'
 import * as layers from './layers'
-import * as visMethods from './visualizations'
 import Tensor from './Tensor'
-import { webgl2 } from './WebGL2'
-import proto from './proto'
 
 const axiosSource = axios.CancelToken.source()
 
@@ -16,106 +18,83 @@ const axiosSource = axios.CancelToken.source()
  */
 export default class Model {
   /**
-   * Create new Model class
-   *
-   * @param {string} config.filepath - path to protobuf-serialized model definition file
-   * @param {Object} [config.headers] - any additional HTTP headers required for resource fetching
-   * @param {Object} [config.filesystem] - specifies that data files are from local file system (Node.js only)
+   * create new Model class
+   * @param {object} config.filepaths
+   * @param {string} config.filepaths.modelFilepath - path to model architecture configuration (json)
+   * @param {string} config.filepaths.weightsFilepath - path to weights data (arraybuffer)
+   * @param {string} config.filepaths.metadataFilepath - path to weights metadata (json)
+   * @param {object} [config.headers] - any additional HTTP headers required for resource fetching
    * @param {boolean} [config.gpu] - enable GPU
-   * @param {boolean} [config.transferLayerOutputs] - in GPU mode, transfer outputs of each layer from GPU->CPU (warning: decreases performance)
-   * @param {boolean} [config.pauseAfterLayerCalls] - break up blocking computation by layer, to allow for intervening DOM updates, for example
-   * @param {string[]} [config.visualizations] - specifies which visualizations to calculate
+   * @param {boolean} [config.pipeline] - configure capable layers to run in pipeline mode (gpu must be enabled)
+   * @param {boolean} [config.layerCallPauses] - force next tick after each layer call
    */
   constructor(config = {}) {
     const {
-      filepath = null,
+      filepaths = {},
       headers = {},
       filesystem = false,
       gpu = false,
-      transferLayerOutputs = false,
-      pauseAfterLayerCalls = false,
-      visualizations = []
+      pipeline = false,
+      layerCallPauses = false
     } = config
 
-    if (!filepath) {
-      throw new Error('[Model] path to protobuf-serialized model definition file is missing.')
+    if (!filepaths.model || !filepaths.weights || !filepaths.metadata) {
+      throw new Error('File paths must be declared for model, weights, and metadata.')
     }
-    this.filepath = filepath
+    this.filepaths = filepaths
+    this.filetypes = { model: 'json', weights: 'arraybuffer', metadata: 'json' }
 
     // HTTP(S) headers used during data fetching
     this.headers = headers
 
-    // specifies that data files are from local file system (Node.js only)
+    // specifies that data files are from local file system
+    // only in node
     this.filesystem = typeof window !== 'undefined' ? false : filesystem
 
-    // event emitter
-    this.events = new EventEmitter()
-
-    // Model config
-    this.id = null
-    this.name = null
-    this.kerasVersion = null
-    this.backend = null
-    this.modelConfig = {}
-    this.modelWeights = []
-
     // flag to enable GPU where possible (disable in node environment)
-    this.gpu = typeof window !== 'undefined' && webgl2.isSupported ? gpu : false
+    this.gpu = typeof window !== 'undefined' ? gpu : false
+    // flag to enable GPU pipeline mode where possible
+    this.pipeline = this.gpu ? pipeline : false
+    // flag to enable 0 ms pauses after layer computation calls
+    this.layerCallPauses = layerCallPauses
 
-    // in GPU mode, transfer intermediate outputs of each layer from GPU->CPU
-    this.transferLayerOutputs = transferLayerOutputs
+    this.data = {
+      // object representing the model architecture configuration,
+      // directly from the to_json() method in Keras
+      model: {},
+      // ArrayBuffer of all the weights, sequentially concatenated
+      // see encoder.py for construction details - essentially the raw flattened
+      // numerical data from the HDF5 file is extracted sequentially and concatenated.
+      weights: null,
+      // array of weight tensor metadata, used to reconstruct tensors from the raw
+      // weights ArrayBuffer above.
+      metadata: []
+    }
 
-    // break up blocking computation by layer, to allow for intervening DOM updates, for example
-    this.pauseAfterLayerCalls = pauseAfterLayerCalls
-
-    // array of model layers info
-    this.modelLayersInfo = []
+    // data request progress
+    this.dataRequestProgress = { model: 0, weights: 0, metadata: 0 }
 
     // map of model layers
     this.modelLayersMap = new Map()
 
-    // map of input tensors
-    this.inputTensorsMap = new Map()
+    // array of model layer names with result
+    this.layersWithResults = []
 
-    // names of input and output layers
-    this.inputLayerNames = []
-    this.outputLayerNames = []
+    // directed acyclic graph of model network
+    this.modelDAG = {}
 
-    // array of model layer names with finished output
-    this.finishedLayerNames = []
-
-    // flag while computations are being performed
-    this.isRunning = false
-
-    // running progress values
-    this.runningProgress = 0
-
-    // stats object for last `predict` call
-    this.predictStats = {}
-
-    // visualizations to calculate
-    this.visMap = new Map()
-    visualizations.forEach(v => {
-      if (v in visMethods) {
-        const visInstance = new visMethods[v]({ modelLayersMap: this.modelLayersMap, gpu: this.gpu })
-        this.visMap.set(v, visInstance)
-      }
-    })
+    // input tensors
+    this.inputTensors = {}
 
     // Promise for when Model class is initialized
     this._ready = this._initialize()
-  }
 
-  /**
-   * Checks whether WebGL 2 is supported by browser
-   */
-  checkGPUSupport() {
-    return webgl2.isSupported
+    // flag while computations are being performed
+    this.isRunning = false
   }
 
   /**
    * Promise for when model data is loaded and layers are initialized.
-   *
    * @returns {Promise}
    */
   ready() {
@@ -131,119 +110,91 @@ export default class Model {
 
   /**
    * Model initialization
-   *
    * @returns {Promise}
    */
-  async _initialize() {
-    this.events.emit('loadingProgress', 0)
-    try {
-      const req = this.filesystem ? this._dataRequestFS() : this._dataRequestHTTP(this.headers)
-      await req
-    } catch (err) {
-      console.log(err)
-      this._interrupt()
-    }
-    this.events.emit('loadingProgress', 100)
-
-    // build directed acyclic graph
-    this._buildDAG()
-
-    // run predict once with initial empty input tensors to cache variables such as shape inference
-    this.inputLayerNames.forEach(name => {
-      const inputLayer = this.modelLayersMap.get(name)
-      inputLayer.call(this.inputTensorsMap.get(name))
-      inputLayer.hasOutput = true
-      inputLayer.visited = true
-    })
-
-    // always turn on `pauseAfterLayerCalls` during initialization
-    // this allows for DOM updates using initProgress events
-    const _pauseAfterLayerCalls = this.pauseAfterLayerCalls
-    this.pauseAfterLayerCalls = true
-    this.runningProgress = 0
-    this.events.emit('initProgress', 0)
-    await this._traverseDAG(this.inputLayerNames, 'initProgress')
-    this.pauseAfterLayerCalls = _pauseAfterLayerCalls
-
-    // reset hasOutput and visited flags in all layers
-    this.finishedLayerNames = []
-    this.modelLayersMap.forEach(layer => {
-      layer.hasOutput = false
-      layer.visited = false
-    })
-
-    // initialize visualizations
-    this.visMap.forEach(visInstance => {
-      visInstance.initialize()
-    })
-
-    this.events.emit('initProgress', 100)
-    return true
-  }
-
-  /**
-   * Makes data HTTP request (browser or node)
-   *
-   * @param {Object} [headers] - any headers to be passed along with request
-   * @returns {Promise}
-   */
-  async _dataRequestHTTP(headers = {}) {
-    try {
-      const res = await axios.get(this.filepath, {
-        responseType: 'arraybuffer',
-        headers,
-        onDownloadProgress: e => {
-          if (e.lengthComputable) {
-            const percentComplete = Math.round(100 * e.loaded / e.total)
-            this.events.emit('loadingProgress', percentComplete)
-          }
-        },
-        cancelToken: axiosSource.token
+  _initialize() {
+    const dataTypes = ['model', 'weights', 'metadata']
+    return Promise.all(
+      dataTypes.map(type => {
+        return this.filesystem ? this._dataRequestFS(type) : this._dataRequestHTTP(type, this.headers)
       })
-
-      this._decodeProtobuf(new Uint8Array(res.data))
-    } catch (err) {
-      if (axios.isCancel(err)) {
-        console.log('[Model] Data request canceled', err.message)
-      } else {
-        throw err
-      }
-    }
+    )
+      .then(() => {
+        this._createLayers()
+        return Promise.resolve()
+      })
+      .catch(err => {
+        console.log(err)
+        this._interrupt()
+      })
   }
 
   /**
    * Makes data FS request (node only)
-   *
+   * @async
+   * @param {string} type - type of requested data, one of `model`, `weights`, or `metadata`.
    * @returns {Promise}
    */
-  async _dataRequestFS() {
+  _dataRequestFS(type) {
     const readFile = Promise.promisify(require('fs').readFile)
-
-    try {
-      const file = await readFile(this.filepath)
-      this._decodeProtobuf(file)
-    } catch (err) {
-      throw err
-    }
+    const filetype = this.filetypes[type]
+    const encoding = filetype === 'json' ? 'utf8' : undefined
+    return readFile(this.filepaths[type], encoding)
+      .then(data => {
+        if (filetype === 'json') {
+          this.data[type] = JSON.parse(data)
+        } else if (filetype === 'arraybuffer') {
+          this.data[type] = data.buffer
+        } else {
+          throw new Error(`Invalid file type: ${filetype}`)
+        }
+        this.dataRequestProgress[type] = 100
+      })
+      .catch(err => {
+        throw err
+      })
   }
 
   /**
-   * Verifies and decodes binary buffer representing protobuf-serialized model definition file.
-   *
-   * @param {Uint8Array|Buffer} buffer
+   * Makes data HTTP request (browser or node)
+   * @async
+   * @param {string} type - type of requested data, one of `model`, `weights`, or `metadata`.
+   * @param {Object} [headers] - any headers to be passed along with request
+   * @returns {Promise}
    */
-  _decodeProtobuf(buffer) {
-    const err = proto.Model.verify(buffer)
-    if (err) {
-      throw new Error(`[Model] Invalid model - check protobuf serialization: {err}`)
-    }
-    const model = proto.Model.decode(buffer)
-    this.id = model.id
-    this.name = model.name
-    this.kerasVersion = model.kerasVersion
-    this.backend = model.backend
-    this.modelConfig = JSON.parse(model.modelConfig)
-    this.modelWeights = model.modelWeights
+  _dataRequestHTTP(type, headers = {}) {
+    return axios
+      .get(this.filepaths[type], {
+        responseType: this.filetypes[type],
+        headers,
+        onDownloadProgress: e => {
+          if (e.lengthComputable) {
+            const percentComplete = Math.round(100 * e.loaded / e.total)
+            this.dataRequestProgress[type] = percentComplete
+          }
+        },
+        cancelToken: axiosSource.token
+      })
+      .then(res => {
+        this.data[type] = res.data
+        this.dataRequestProgress[type] = 100
+      })
+      .catch(err => {
+        if (axios.isCancel(err)) {
+          console.log('Data request canceled', err.message)
+        } else {
+          throw err
+        }
+      })
+  }
+
+  /**
+   * Loading progress calculated from all the data requests combined.
+   * @returns {number} progress
+   */
+  getLoadingProgress() {
+    const progressValues = values(this.dataRequestProgress)
+    return Math.round(sum(progressValues) / progressValues.length)
   }
 
   /**
@@ -251,51 +202,39 @@ export default class Model {
    * Iterate through all layers and set `gpu` attribute
    * @param {boolean} mode - on/off
    */
-  toggleGPU(mode) {
+  toggleGpu(mode) {
     if (typeof mode === 'undefined') {
       this.gpu = !this.gpu
     } else {
       this.gpu = mode
     }
-    this.modelLayersMap.forEach(layer => {
-      layer.toggleGPU(this.gpu)
-    })
-    this.visMap.forEach(visInstance => {
-      visInstance.gpu = this.gpu
-    })
-    this.resetInputTensors()
+    for (let layer of this.modelLayersMap.values()) {
+      layer.toggleGpu(this.gpu)
+    }
   }
 
   /**
-   * Resets input tensors
-   */
-  resetInputTensors() {
-    this.inputLayerNames.forEach(name => {
-      const inputLayer = this.modelLayersMap.get(name)
-      this.inputTensorsMap.set(name, new Tensor([], inputLayer.shape))
-    })
-  }
-
-  /**
-   * Builds directed acyclic graph of model layers
+   * Builds network layer DAG
    *
-   * Every layer in the model defines inbound and outbound nodes. For Keras models of class Sequential, we still convert
-   * the list into DAG format for straightforward interoperability with graph models (however, we must first create an
-   * Input layer as the initial layer. For class Model, the DAG is constructed from the configuration inbound and
-   * outbound nodes. Note that Models can have layers be entire Sequential branches.
+   * For Keras models of class Sequential, we still convert the list into DAG format
+   * for straightforward interoperability with graph models. We must first create an
+   * Input layer as the initial layer, however.
+   *
+   * For class Model, the network DAG is constructed from the configuration inbound
+   * and outbound nodes. Note that Models can have layers be entire Sequential branches.
    */
-  _buildDAG() {
-    const modelClass = this.modelConfig.class_name
+  _createLayers() {
+    const modelClass = this.data.model.class_name
 
     let modelConfig = []
     if (modelClass === 'Sequential') {
-      modelConfig = this.modelConfig.config
+      modelConfig = this.data.model.config
     } else if (modelClass === 'Model') {
-      modelConfig = this.modelConfig.config.layers
+      modelConfig = this.data.model.config.layers
     }
 
     if (!(Array.isArray(modelConfig) && modelConfig.length)) {
-      throw new Error('[Model] Model configuration does not contain any layers.')
+      throw new Error('Model configuration does not contain any layers.')
     }
 
     modelConfig.forEach((layerDef, index) => {
@@ -308,29 +247,27 @@ export default class Model {
           const branchLayerClass = branchLayerDef.class_name
           const branchLayerConfig = branchLayerDef.config
 
-          const branchInboundLayerNames =
-            branchIndex === 0
-              ? layerDef.inbound_nodes[0].map(node => node[0])
-              : [layerConfig[branchIndex - 1].config.name]
+          const branchInboundLayerNames = branchIndex === 0
+            ? layerDef.inbound_nodes[0].map(node => node[0])
+            : [layerConfig[branchIndex - 1].config.name]
 
           this._createLayer(branchLayerClass, branchLayerConfig, branchInboundLayerNames)
         })
       } else if (!(layerClass in layers)) {
-        throw new Error(`[Model] Layer ${layerClass} specified in model configuration is not implemented!`)
+        throw new Error(`Layer ${layerClass} specified in model configuration is not implemented!`)
       } else {
         // create InputLayer node for Sequential class (which is not explicitly defined in config)
         // create input tensor for InputLayer specified in Model class (layer itself created later)
         if (modelClass === 'Sequential' && index === 0) {
           const inputName = 'input'
           const inputShape = layerConfig.batch_input_shape.slice(1)
-          const layer = new layers.InputLayer({ name: inputName, shape: inputShape, gpu: this.gpu })
+          const layer = new layers.InputLayer({ name: inputName, shape: inputShape })
           this.modelLayersMap.set(inputName, layer)
-          this.inputTensorsMap.set(inputName, new Tensor([], inputShape))
-          this.inputLayerNames.push(inputName)
+          this.modelDAG[inputName] = { layerClass: 'InputLayer', name: inputName, inbound: [], outbound: [] }
+          this.inputTensors[inputName] = new Tensor([], inputShape)
         } else if (modelClass === 'Model' && layerClass === 'InputLayer') {
           const inputShape = layerConfig.batch_input_shape.slice(1)
-          this.inputTensorsMap.set(layerConfig.name, new Tensor([], inputShape))
-          this.inputLayerNames.push(layerConfig.name)
+          this.inputTensors[layerConfig.name] = new Tensor([], inputShape)
         }
 
         let inboundLayerNames = []
@@ -346,30 +283,34 @@ export default class Model {
             inboundLayerNames = inboundNodes[0].map(node => node[0])
           }
         }
+
         this._createLayer(layerClass, layerConfig, inboundLayerNames)
       }
     })
-
-    this.modelLayersMap.forEach(layer => {
-      this.modelLayersInfo.push(_.pick(layer, ['name', 'description', 'layerClass', 'inbound', 'outbound']))
-      if (layer.outbound.length === 0) {
-        this.outputLayerNames.push(layer.name)
-      }
-    })
-
-    this.inputLayerNames.sort()
-    this.outputLayerNames.sort()
   }
 
   /**
-   * Create single layer
-   *
-   * @param {Object} layerClass
+   * Create single layer.
+   * @param {String} layerClass
    * @param {Object} layerConfig
-   * @param {string[]} inboundLayerNames
+   * @param {Array<String>} inboundLayerNames
+   * @param {Boolean} isSequential
    */
   _createLayer(layerClass, layerConfig, inboundLayerNames) {
-    const layer = new layers[layerClass](Object.assign({}, layerConfig, { gpu: this.gpu }))
+    let layer
+    if (layerClass === 'Bidirectional' || layerClass === 'TimeDistributed') {
+      // create wrapper layers
+      const wrappedLayerConfig = layerConfig.layer.config
+      const wrappedLayerClass = layerConfig.layer.class_name
+      wrappedLayerConfig.gpu = this.gpu
+
+      layer = new layers[layerClass](
+        Object.assign({}, layerConfig, { layer: new layers[wrappedLayerClass](wrappedLayerConfig) })
+      )
+    } else {
+      // create regular layers
+      layer = new layers[layerClass](Object.assign({ gpu: this.gpu, pipeline: this.pipeline }, layerConfig))
+    }
 
     // layer weights
     let weightNames = []
@@ -386,248 +327,229 @@ export default class Model {
     } else {
       weightNames = layer.params.map(param => `${layerConfig.name}/${param}`)
     }
-
     if (weightNames && weightNames.length) {
       const weights = weightNames.map(weightName => {
-        const weightDef = _.find(this.modelWeights, w => {
-          const weightRE = new RegExp(`^.*${weightName}`)
-          return weightRE.test(w.weightName)
+        const paramMetadata = find(this.data.metadata, meta => {
+          const weightRE = new RegExp(`^${weightName}`)
+          return weightRE.test(meta.weight_name)
         })
-
-        if (!weightDef) {
+        if (!paramMetadata) {
           throw new Error(`[Model] error loading weights.`)
         }
 
-        const { data, shape, type } = weightDef
-
-        // need to make a copy of underlying ArrayBuffer
-        const buf = new ArrayBuffer(data.byteLength)
-        const arr = new Uint8Array(buf)
-        arr.set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength))
-
-        if (type === 'uint8') {
-          // weights are quantized
-          const { quantizeMin, quantizeMax } = weightDef
-          const unquantized = new Float32Array(arr)
-          for (let i = 0, len = unquantized.length; i < len; i++) {
-            unquantized[i] *= (quantizeMax - quantizeMin) / 255
-            unquantized[i] += quantizeMin
-          }
-          return new Tensor(unquantized, shape)
-        } else {
-          return new Tensor(new Float32Array(buf), shape)
-        }
+        const { offset, length, shape } = paramMetadata
+        return new Tensor(new Float32Array(this.data.weights, offset, length), shape)
       })
-
       layer.setWeights(weights)
     }
 
     this.modelLayersMap.set(layerConfig.name, layer)
+    this.modelDAG[layerConfig.name] = { layerClass, name: layerConfig.name, inbound: [], outbound: [] }
 
     inboundLayerNames.forEach(layerName => {
-      this.modelLayersMap.get(layerConfig.name).inbound.push(layerName)
-      this.modelLayersMap.get(layerName).outbound.push(layerConfig.name)
+      this.modelDAG[layerConfig.name].inbound.push(layerName)
+      this.modelDAG[layerName].outbound.push(layerConfig.name)
     })
+  }
+
+  /**
+   * Runs .call() on merge layer
+   * @param {Layer} currentLayer
+   * @param {Layer[]} inboundLayers
+   * @param {boolean} copyBeforeCall
+   * @returns {Tensor}
+   */
+  _mergeLayerCall(currentLayer, inboundLayers, copyBeforeCall) {
+    let inputs = inboundLayers.map(layer => layer.result)
+    const canRunInPipeline = inputs.every(x => x._fromPipeline)
+    if (!canRunInPipeline || !currentLayer._pipelineEnabled) {
+      // If currentLayer is not pipeline enabled, then all inbound results
+      // must first be converted from weblas tensors to regular tensors, if
+      // necessary.
+      // If currentLayer is pipeline enabled, but not all inbound results are
+      // from pipeline mode, then all must still be converted from weblas
+      // tensors to regular tensors.
+      inputs = inputs.map((x, i) => {
+        if (x._fromPipeline) {
+          // copy from weblas tensor into regular tensor
+          return inboundLayers[i].transferFromPipeline(x)
+        } else if (copyBeforeCall) {
+          // make a copy of regular tensor
+          return new Tensor(x.tensor.data, x.tensor.shape)
+        }
+        return x
+      })
+    } else if (copyBeforeCall) {
+      // If currentLayer is pipeline enabled, and all inbound results are from
+      // pipeline mode as well, but there are sibling layer nodes that require
+      // the same input(s) (thus copyBeforeCall is true), then we directly copy
+      // the weblas tensors.
+      inputs = inputs.map(x => {
+        let xNew = new Tensor([], x.tensor.shape)
+        xNew.copyFromWeblasTensor(x.weblasTensor)
+        xNew._fromPipeline = true
+        xNew._actualShape = x._actualShape.slice()
+        return xNew
+      })
+    }
+
+    return currentLayer.call(inputs)
+  }
+
+  /**
+   * Runs .call() on regular layer
+   * @param {Layer} currentLayer
+   * @param {Layer} inboundLayer
+   * @param {boolean} copyBeforeCall
+   * @returns {Tensor}
+   */
+  _regularLayerCall(currentLayer, inboundLayer, copyBeforeCall) {
+    let inboundLayerResult = inboundLayer.result
+    if (!inboundLayerResult._fromPipeline || !currentLayer._pipelineEnabled) {
+      // If currentLayer is not pipeline enabled or inbound layer result is not
+      // from pipeline mode, then result must first be converted from a weblas
+      // tensor to a regular tensor, if necessary.
+      if (inboundLayerResult._fromPipeline) {
+        // copy from weblas tensor into regular tensor
+        inboundLayerResult = inboundLayer.transferFromPipeline(inboundLayerResult)
+      } else if (copyBeforeCall) {
+        // make a copy of regular tensor
+        inboundLayerResult = new Tensor(inboundLayerResult.tensor.data, inboundLayerResult.tensor.shape)
+      }
+    } else if (copyBeforeCall) {
+      // If currentLayer is pipeline enabled, and prev layer result is from
+      // pipeline mode as well, but there are sibling layer nodes that require
+      // the same input (thus copyBeforeCall is true), then we directly copy
+      // the weblas tensor.
+      let xNew = new Tensor([], inboundLayerResult.tensor.shape)
+      xNew.copyFromWeblasTensor(inboundLayerResult.weblasTensor)
+      xNew._fromPipeline = true
+      xNew._actualShape = inboundLayerResult._actualShape.slice()
+      inboundLayerResult = xNew
+    }
+
+    return currentLayer.call(inboundLayerResult)
   }
 
   /**
    * Async function for recursively traversing the DAG
    * Graph object is stored in `this.modelDAG`, keyed by layer name.
    * Layers are retrieved from Map object `this.modelLayersMap`.
-   *
-   * @param {string[]} nodes - array of layer names
-   * @param {string} eventName - event to emit by this.events EventEmitter
-   * @returns {Promise}
+   * @async
+   * @param {[]string} nodes - array of layer names
+   * @returns {Promise.<boolean>}
    */
-  async _traverseDAG(nodes, eventName) {
+  async _traverseDAG(nodes) {
     if (nodes.length === 0) {
       // Stopping criterion:
       // an output node will have 0 outbound nodes.
-      this.runningProgress = 100
-      this.events.emit(eventName, 100)
       return true
     } else if (nodes.length === 1) {
       // Where computational logic lives for a given layer node
-      // - Makes sure outputs are available from inbound layer nodes
-      // - Keeps async function going until outputs are available from inbound layer nodes
-      //   (important for merge layer nodes where multiple inbound nodes may complete asynchronously)
+      // - Makes sure results are available from inbound layer nodes
+      // - Keeps generator going until results are available from inbound layer nodes
+      //   (important for merge layer nodes where multiple inbound nodes may
+      //    complete asynchronously)
       // - Runs computation for current layer node: .call()
-      // - Starts new async function for outbound nodes
+      // - Starts new generator function for outbound nodes
       const node = nodes[0]
-      const currentLayer = this.modelLayersMap.get(node)
-
-      if (currentLayer.layerClass === 'InputLayer') {
-        this.finishedLayerNames.push(this.modelLayersMap.get(node).name)
-      } else {
-        const currentLayer = this.modelLayersMap.get(node)
+      const { layerClass, inbound, outbound } = this.modelDAG[node]
+      if (layerClass !== 'InputLayer') {
+        let currentLayer = this.modelLayersMap.get(node)
         if (currentLayer.visited) {
           return false
         }
 
-        const inboundLayers = currentLayer.inbound.map(n => this.modelLayersMap.get(n))
-        if (!_.every(_.map(inboundLayers, 'hasOutput'))) {
+        const inboundLayers = inbound.map(n => this.modelLayersMap.get(n))
+        if (!every(inboundLayers.map(layer => layer.hasResult))) {
           return false
         }
 
-        if (currentLayer.isMergeLayer) {
-          currentLayer.call(_.map(inboundLayers, 'output'))
+        const numSiblingNodes = inbound
+          .map(n => this.modelDAG[n].outbound)
+          .reduce((num, outbound) => num + outbound.length, 0)
+        const copyBeforeCall = numSiblingNodes >= 1
+
+        if (['Merge', 'Add', 'Multiply', 'Average', 'Maximum', 'Concatenate', 'Dot'].includes(layerClass)) {
+          currentLayer.result = this._mergeLayerCall(currentLayer, inboundLayers, copyBeforeCall)
         } else {
-          currentLayer.call(inboundLayers[0].output)
+          currentLayer.result = this._regularLayerCall(currentLayer, inboundLayers[0], copyBeforeCall)
         }
 
-        currentLayer.hasOutput = true
+        currentLayer.hasResult = true
         currentLayer.visited = true
-        this.finishedLayerNames.push(currentLayer.name)
-
-        if (this.pauseAfterLayerCalls) {
+        this.layersWithResults.push(currentLayer.name)
+        if (this.layerCallPauses) {
+          // temporarily pause 0 ms
+          // useful for allowing DOM operations and other simultaneously running functions on the main thread
           await Promise.delay(0)
         }
+      } else {
+        this.layersWithResults.push(this.modelLayersMap.get(node).name)
       }
-
-      this.runningProgress += 100 / this.modelLayersMap.size
-      this.events.emit(eventName, this.runningProgress)
-
-      await this._traverseDAG(currentLayer.outbound, eventName)
+      await this._traverseDAG(outbound)
     } else {
-      await Promise.all(nodes.map(node => this._traverseDAG([node], eventName)))
+      await Promise.all(nodes.map(node => this._traverseDAG([node])))
     }
-  }
-
-  /**
-   * Transfer intermediate outputs if specified, only in GPU mode and if transferLayerOutputs is set to true
-   */
-  _maybeTransferIntermediateOutputs() {
-    if (this.gpu && this.transferLayerOutputs) {
-      this.modelLayersMap.forEach(layer => {
-        if (layer.output && layer.output.glTexture) {
-          webgl2.bindOutputTexture(layer.output.glTexture, layer.output.glTextureShape)
-          layer.output.transferFromGLTexture()
-          if (layer.output.is2DReshaped) {
-            layer.output.reshapeFrom2D()
-          }
-        }
-      })
-    }
-  }
-
-  /**
-   * Load data to input layer nodes
-   *
-   * @param {Object} inputData - object where the keys are the named inputs of the model,
-   * and values the TypedArray numeric data
-   */
-  loadData(inputData) {
-    this.inputLayerNames.forEach(name => {
-      const inputLayer = this.modelLayersMap.get(name)
-      this.inputTensorsMap.get(name).replaceTensorData(inputData[name])
-      inputLayer.call(this.inputTensorsMap.get(name))
-      inputLayer.hasOutput = true
-      inputLayer.visited = true
-    })
   }
 
   /**
    * Predict
-   *
+   * @async
    * @param {Object} inputData - object where the keys are the named inputs of the model,
-   * and values the TypedArray numeric data
-   * @returns {Promise} - outputData object where the keys are the named outputs of the model,
-   * and values the TypedArray numeric data
+   *                             and values the TypedArray numeric data
+   * @returns {Promise.<Object>} - outputData object where the keys are the named outputs
+   *                             of the model, and values the TypedArray numeric data
    */
   async predict(inputData) {
     this.isRunning = true
-    this.runningProgress = 0
-    this.events.emit('predictProgress', 0)
 
-    if (!_.isEqual(_.keys(inputData).sort(), this.inputLayerNames)) {
+    const inputNames = keys(this.inputTensors).sort()
+    if (!isEqual(keys(inputData).sort(), inputNames)) {
       this.isRunning = false
-      throw new Error(
-        '[Model] predict() must take an object where the keys are the named inputs of the model: ' +
-          JSON.stringify(this.inputLayerNames)
-      )
+      throw new Error(`predict() must take an object where the keys are the named inputs of the model: ${inputNames}.`)
     }
-    if (!_.every(this.inputLayerNames, name => inputData[name] instanceof Float32Array)) {
+    if (!every(inputNames, inputName => inputData[inputName] instanceof Float32Array)) {
       this.isRunning = false
-      throw new Error('[Model] predict() must take an object where the values are the flattened data as Float32Array.')
+      throw new Error('predict() must take an object where the values are the flattened data as Float32Array.')
     }
 
-    // reset hasOutput and visited flags in all layers
-    this.finishedLayerNames = []
-    this.modelLayersMap.forEach(layer => {
-      layer.hasOutput = false
+    // reset hasResult and visited flags in all layers
+    this.layersWithResults = []
+    for (let layer of this.modelLayersMap.values()) {
+      layer.hasResult = false
       layer.visited = false
-    })
+    }
 
     // load data to input tensors
-    let start = now()
-    this.loadData(inputData)
-    this.predictStats.loadData = now() - start
+    inputNames.forEach(inputName => {
+      let inputLayer = this.modelLayersMap.get(inputName)
+      this.inputTensors[inputName].replaceTensorData(inputData[inputName])
+      inputLayer.result = inputLayer.call(this.inputTensors[inputName])
+      inputLayer.hasResult = true
+      inputLayer.visited = true
+    })
 
-    // start traversing DAG at inputs
-    start = now()
-    await this._traverseDAG(this.inputLayerNames, 'predictProgress')
-    this.predictStats.forwardPass = now() - start
-
-    // transfer intermediate outputs if specified
-    this._maybeTransferIntermediateOutputs()
+    // start traversing DAG at input
+    await this._traverseDAG(inputNames)
 
     // outputs are layers with no outbound nodes
-    const modelClass = this.modelConfig.class_name
-    const outputData = {}
+    const modelClass = this.data.model.class_name
     if (modelClass === 'Sequential') {
-      const outputLayer = this.modelLayersMap.get(this.outputLayerNames[0])
-      outputData['output'] = outputLayer.output.tensor.data
+      const outputLayer = find(values(this.modelDAG), node => !node.outbound.length)
+      const { result } = this.modelLayersMap.get(outputLayer.name)
+      const outputData = { output: result.tensor.data }
+      this.isRunning = false
+      return outputData
     } else if (modelClass === 'Model') {
-      this.outputLayerNames.forEach(layerName => {
-        const outputLayer = this.modelLayersMap.get(layerName)
-        outputData[layerName] = outputLayer.output.tensor.data
+      const outputLayers = values(this.modelDAG).filter(node => !node.outbound.length)
+      let outputData = {}
+      outputLayers.forEach(layer => {
+        const { result } = this.modelLayersMap.get(layer.name)
+        outputData[layer.name] = result.tensor.data
       })
+      this.isRunning = false
+      return outputData
     }
-
-    // update visualizations
-    start = now()
-    this.visMap.forEach(visInstance => {
-      visInstance.update()
-    })
-    this.predictStats.visualizations = now() - start
-
-    this.isRunning = false
-    this.events.emit('predictProgress', 100)
-    return outputData
-  }
-
-  /**
-   * Run computation on a specific layer
-   *
-   * @param {string} layerName
-   * @param {Tensor|Object} input - can be Tensor instance or ndarray object
-   */
-  layerCall(layerName, input) {
-    if (!this.modelLayersMap.has(layerName)) return
-
-    let x
-    if (input instanceof Tensor) {
-      x = input
-    } else {
-      x = new Tensor(input.data, input.shape)
-    }
-    const layer = this.modelLayersMap.get(layerName)
-    return layer.call(x)
-  }
-
-  /**
-   * Cleanup - important for memory management
-   */
-  cleanup() {
-    // delete references to WebGL textures and buffers to free up GPU memory
-    webgl2.clearRefs()
-
-    // Maps must be manually cleared so that values may be garbage collected
-    this.modelLayersMap.clear()
-    this.inputTensorsMap.clear()
-    this.visMap.clear()
-
-    // delete reference to model weights object
-    delete this.modelWeights
   }
 }

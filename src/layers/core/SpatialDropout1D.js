@@ -8,29 +8,25 @@ import Layer from '../../Layer'
 export default class SpatialDropout1D extends Layer {
   /**
    * Creates an SpatialDropout1D layer
-   *
-   * @param {Object} [attrs] - layer config attributes
-   * @param {number} [attrs.p] - fraction of the input units to drop (between 0 and 1)
+   * @param {number} attrs.p - fraction of the input units to drop (between 0 and 1)
+   * @param {number} [attrs.dimOrdering] - `tf` or `th`
    */
   constructor(attrs = {}) {
     super(attrs)
     this.layerClass = 'SpatialDropout1D'
 
-    const { p = 0.5 } = attrs
-
-    this.description = `${p}`
+    const { p = 0.5, dimOrdering = 'tf' } = attrs
 
     this.p = Math.min(Math.max(0, p), 1)
+    this.dimOrdering = dimOrdering
   }
 
   /**
    * Method for layer computational logic
-   *
    * @param {Tensor} x
-   * @returns {Tensor}
+   * @returns {Tensor} x
    */
   call(x) {
-    this.output = x
-    return this.output
+    return x
   }
 }
