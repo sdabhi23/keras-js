@@ -22,7 +22,7 @@ Run [Keras](https://github.com/keras-team/keras) models in the browser, with GPU
 
 Library version compatibility: Keras 2.1.2
 
-**The demos are available in [the original repository](https://github.com/transcranial/keras-js/)**
+**The demos and tests are available in [the original repository](https://github.com/transcranial/keras-js/)**
 
 ## [Documentation](https://transcranial.github.io/keras-js-docs)
 

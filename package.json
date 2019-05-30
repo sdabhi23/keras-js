@@ -10,8 +10,6 @@
     "build:node": "rm -rf lib; NODE_ENV=production BABEL_ENV=node babel src --out-dir lib",
     "build": "npm run build:browser && npm run build:node",
     "server": "http-server . -c-1 -p 3000",
-    "demos:watch": "cd demos; NODE_ENV=development BABEL_ENV=browser webpack --watch --config webpack.config.js",
-    "demos:build": "cd demos; rm -rf dist; NODE_ENV=production BABEL_ENV=browser webpack --config webpack.config.js",
     "proto2js": "pbjs --target static-module --wrap es6 proto/model.proto > src/proto.js"
   },
   "repository": {
@@ -19,7 +17,7 @@
     "url": "git+https://github.com/sdabhi23/keras-js.git"
   },
   "keywords": ["keras", "deep", "learning", "neural", "networks", "javascript", "webgl", "webgl2", "gpu"],
-  "author": "Shrey Dabhi <shrey.dabhi23@gmail.com>",
+  "author": "Leon Chen <leon@md.ai>, Shrey Dabhi <shrey.dabhi23@gmail.com>",
   "license": "MIT",
   "bugs": {
     "url": "https://github.com/transcranial/keras-js/issues"
@@ -55,22 +53,7 @@
     "babel-loader": "8.0.6",
     "babel-plugin-inline-import": "^3.0.0",
     "babel-plugin-lodash": "^3.3.4",
-    "blueimp-load-image": "^2.21.0",
-    "chroma-js": "^2.0.3",
-    "css-loader": "^2.1.1",
-    "eslint": "^5.16.0",
-    "eslint-loader": "^2.1.2",
-    "eslint-plugin-html": "^5.0.5",
     "http-server": "^0.11.1",
-    "postcss-cssnext": "^3.1.0",
-    "postcss-import": "^12.0.1",
-    "postcss-loader": "^3.0.0",
-    "style-loader": "^0.23.1",
-    "vue": "^2.6.10",
-    "vue-loader": "^15.7.0",
-    "vue-router": "^3.0.6",
-    "vue-template-compiler": "^2.6.10",
-    "vuetify": "^1.5.14",
     "webpack": "^3.10.0"
   }
 }
