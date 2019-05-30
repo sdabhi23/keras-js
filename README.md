@@ -50,4 +50,4 @@ Check out the `demos/` directory for real examples running Keras.js in VueJS.
 
 ## [Documentation](https://transcranial.github.io/keras-js-docs)
 
-[MIT License](https://github.com/transcranial/keras-js/blob/master/LICENSE)
+[MIT License](https://github.com/sdabhi23/keras-js/blob/master/LICENSE)
