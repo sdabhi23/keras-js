@@ -1,20 +1,15 @@
-<p align="center">
-  <strong>**This project is no longer active. Please check out <a href="http://js.tensorflow.org">TensorFlow.js</a>.**<br/>This fork is not being actively maintained.</strong>
-</p>
+<strong>**This project is no longer active. Please check out <a href="http://js.tensorflow.org">TensorFlow.js</a>.**<br/>This fork is not being actively maintained.</strong>
 
-<p align="center">
-  <a href="https://transcranial.github.io/keras-js">
-    <img src="https://cdn.rawgit.com/transcranial/keras-js/73aa4cca/assets/logo.svg" width="300px" />
-  </a>
-</p>
+<a href="https://transcranial.github.io/keras-js">
+  <img src="https://cdn.rawgit.com/transcranial/keras-js/73aa4cca/assets/logo.svg" width="300px" />
+</a>
 
-<p align="center">
-  <strong>Run Keras models in the browser, with GPU support using WebGL</strong>
-</p>
+<strong>Run Keras models in the browser, with GPU support using WebGL</strong>
 
-<br/>
+![npm (scoped)](https://img.shields.io/npm/v/@sdabhi23/keras-js.svg)
 
 ---
+
 **CHANGELOG:**
 - Switch to v0.3.0 of the original library
 - Updated the module to resolve [#109 (babel polyfill issue)](https://github.com/transcranial/keras-js/issues/109)
